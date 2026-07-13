@@ -1,52 +1,52 @@
-# Astro Island 架构调研
+# Astro Island Architecture
 
-## 概览
+## Overview
 
-Astro 的 island 架构可以拆成两条主线：
+Astro's island architecture has two main execution paths:
 
-1. **客户端 islands（`client:*`）**：服务端先输出静态 HTML，只把需要交互的组件包装成 `<astro-island>`，再在浏览器中按需局部 hydrate。
-2. **服务端 islands（`server:defer`）**：服务端先输出 fallback，占位内容随后通过单独的请求拉取真实 HTML，再替换回页面。
+1. **Client islands (`client:*`)**: Astro renders static HTML on the server, wraps only interactive components in `<astro-island>`, and hydrates them later in the browser.
+2. **Server islands (`server:defer`)**: Astro renders fallback content first, then fetches the island's HTML separately and replaces the placeholder.
 
-从实现上看，这套机制主要由以下阶段组成：
+At a high level, the implementation works like this:
 
-1. 编译阶段识别哪些组件需要变成 island
-2. SSR 阶段提取 hydration 指令并输出 `<astro-island>`
-3. 页面注入 island runtime 与各类 directive 脚本
-4. 浏览器端按 `client:*` 策略加载组件并执行 hydrate
-5. `server:defer` 通过专门的 endpoint 返回岛的 HTML
+1. The compiler marks components that should become islands
+2. SSR extracts hydration directives and emits `<astro-island>`
+3. Astro injects the island runtime and client directive scripts into the page
+4. The browser runtime loads and hydrates islands according to their `client:*` strategy
+5. `server:defer` uses a dedicated endpoint to return island HTML
 
 ---
 
-## 一、编译阶段：识别 island 组件
+## 1. Compile time: identifying island components
 
-关键入口：
+Key files:
 
-- `/home/runner/work/astro/astro/packages/astro/src/vite-plugin-astro/index.ts`
-- `/home/runner/work/astro/astro/packages/astro/src/vite-plugin-astro/metadata.ts`
+- `packages/astro/src/vite-plugin-astro/index.ts`
+- `packages/astro/src/vite-plugin-astro/metadata.ts`
 
-`vite-plugin-astro` 在调用编译器后，会把编译结果中的以下信息写入 `meta.astro`：
+After compiling an `.astro` file, `vite-plugin-astro` stores these results in `meta.astro`:
 
 - `hydratedComponents`
 - `clientOnlyComponents`
 - `serverComponents`
 
-这意味着 Astro 在编译阶段就已经区分出：
+That metadata tells the rest of the pipeline:
 
-- 哪些组件需要客户端 hydrate
-- 哪些组件是 `client:only`
-- 哪些组件属于服务端 islands
+- which components need client hydration
+- which components are `client:only`
+- which components are server islands
 
-这是 island 架构后续构建、SSR 和运行时行为的基础。
+This is the foundation for Astro's later build, SSR, and runtime behavior.
 
 ---
 
-## 二、SSR 阶段：提取 `client:*` 指令
+## 2. SSR: extracting `client:*` directives
 
-关键文件：
+Key file:
 
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/server/hydration.ts`
+- `packages/astro/src/runtime/server/hydration.ts`
 
-`extractDirectives()` 会从组件 props 中拆出 Astro 的特殊指令，包括：
+`extractDirectives()` removes Astro's special props from the component input, including:
 
 - `client:load`
 - `client:idle`
@@ -56,48 +56,48 @@ Astro 的 island 架构可以拆成两条主线：
 - `client:component-path`
 - `client:component-export`
 
-处理结果分成两部分：
+The result is split into two parts:
 
-1. **普通 props**：继续传给组件做 SSR
-2. **hydration metadata**：记录 hydrate 指令、组件模块路径、导出名和指令参数
+1. **Regular props**: still passed into the server render
+2. **Hydration metadata**: directive name, directive value, component module path, and export name
 
-也就是说，Astro 会先把 island 所需的元信息从普通组件 props 里抽离出来，再交给渲染阶段使用。
-
----
-
-## 三、SSR 阶段：把组件包装成 `<astro-island>`
-
-关键文件：
-
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/server/render/component.ts`
-
-这是客户端 island 最核心的服务端输出入口。
-
-主要流程是：
-
-1. 调用 renderer 执行组件 SSR，得到静态 HTML
-2. 如果组件没有 `client:*` 指令，就直接输出 HTML
-3. 如果组件带有 `client:*` 指令，就生成一个 island 描述对象
-4. 最终把组件输出成 `<astro-island>` 自定义元素
-
-几个关键点：
-
-- `extractDirectives()` 的结果会写入组件 metadata
-- `generateHydrateScript()` 会把 hydrate 所需信息序列化到 island 属性中
-- SSR 输出的 HTML 会作为 `<astro-island>` 的 children 保留下来
-- 嵌套 slot 会被包装和补齐，保证客户端 hydrate 时仍可恢复
-
-Astro 的“部分水合”不是把整个页面交给前端框架，而是只把有交互需求的那部分组件包进 `<astro-island>`。
+So Astro separates island-specific metadata from normal component props before rendering.
 
 ---
 
-## 四、生成 hydration 元数据
+## 3. SSR: wrapping interactive output in `<astro-island>`
 
-关键文件：
+Key file:
 
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/server/hydration.ts`
+- `packages/astro/src/runtime/server/render/component.ts`
 
-`generateHydrateScript()` 会给 `<astro-island>` 挂上运行时需要的关键属性，典型包括：
+This is the core server-side entry point for client islands.
+
+The main flow is:
+
+1. Render the component to static HTML through the matched renderer
+2. If there is no `client:*` directive, emit the HTML directly
+3. If there is a `client:*` directive, build an island description
+4. Emit the component as an `<astro-island>` custom element
+
+Important details:
+
+- the result of `extractDirectives()` is copied into component metadata
+- `generateHydrateScript()` serializes hydration data onto the island element
+- the SSR HTML is preserved as the island's children
+- slot content may be wrapped so it can be recovered during hydration
+
+Astro's "partial hydration" is therefore implemented by isolating interactive regions, not by handing the whole page to a client framework.
+
+---
+
+## 4. Generating hydration metadata
+
+Key file:
+
+- `packages/astro/src/runtime/server/hydration.ts`
+
+`generateHydrateScript()` adds the attributes the browser runtime needs, including:
 
 - `component-url`
 - `component-export`
@@ -108,38 +108,38 @@ Astro 的“部分水合”不是把整个页面交给前端框架，而是只�
 - `opts`
 - `before-hydration-url`
 
-这些字段分别承载：
+Those attributes carry:
 
-- 组件模块地址
-- 组件导出名
-- 前端框架 renderer 的 client entry
-- 序列化后的 props
-- hydrate 策略（如 `load`、`idle`、`visible`）
-- 当前节点尚未 hydrate 的标记
-- hydrate 参数
-- hydrate 前需要预先执行的脚本
+- the component module URL
+- the export name to read from that module
+- the client entry for the framework renderer
+- serialized props
+- the hydration strategy (`load`, `idle`, `visible`, and so on)
+- a marker that the island is still in SSR state
+- directive arguments
+- an optional script that must run before hydration
 
-因此，浏览器端并不需要再额外查询 island 的定义；它只需要读取 `<astro-island>` 的属性，就能知道如何恢复组件。
+The browser runtime does not need a separate lookup step. It can reconstruct the island entirely from the `<astro-island>` attributes.
 
 ---
 
-## 五、页面注入 runtime 与 directive 脚本
+## 5. Injecting the runtime and directive scripts
 
-关键文件：
+Key files:
 
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/server/scripts.ts`
-- `/home/runner/work/astro/astro/packages/astro/src/core/client-directive/default.ts`
+- `packages/astro/src/runtime/server/scripts.ts`
+- `packages/astro/src/core/client-directive/default.ts`
 
-Astro 在 SSR 输出过程中，会按需注入两类脚本：
+During SSR, Astro injects two kinds of scripts as needed:
 
-1. **directive 脚本**：定义 `client:load`、`client:idle`、`client:visible`、`client:media`、`client:only` 的触发逻辑
-2. **island runtime 脚本**：定义 `<astro-island>` 这个自定义元素
+1. **Directive scripts**: define the trigger behavior for `client:load`, `client:idle`, `client:visible`, `client:media`, and `client:only`
+2. **Island runtime script**: defines the `<astro-island>` custom element
 
-默认指令的注册位置在：
+The built-in directive registry lives in:
 
-- `/home/runner/work/astro/astro/packages/astro/src/core/client-directive/default.ts`
+- `packages/astro/src/core/client-directive/default.ts`
 
-默认内置的 client directives 为：
+The default built-in client directives are:
 
 - `idle`
 - `load`
@@ -147,44 +147,44 @@ Astro 在 SSR 输出过程中，会按需注入两类脚本：
 - `only`
 - `visible`
 
-它们都以预构建脚本的形式注入，最终在浏览器里挂到全局的 `Astro[directive]` 上。
+Each one is injected from a prebuilt script and exposed to the browser runtime through `Astro[directive]`.
 
 ---
 
-## 六、浏览器端 runtime：`astro-island` 自定义元素
+## 6. Browser runtime: the `astro-island` custom element
 
-关键文件：
+Key file:
 
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/server/astro-island.ts`
+- `packages/astro/src/runtime/server/astro-island.ts`
 
-这是 Astro island 架构最关键的运行时代码。
+This is the most important runtime file for Astro islands.
 
-它做的事情包括：
+It is responsible for:
 
-1. 定义自定义元素 `astro-island`
-2. 在元素连接到 DOM 时启动 hydrate 流程
-3. 根据属性读取组件 URL、renderer URL、props、slots 和 client directive
-4. 动态 `import()` 组件模块和 renderer
-5. 反序列化 props
-6. 调用对应 renderer 的 hydrator 完成局部激活
+1. defining the `astro-island` custom element
+2. starting hydration when the element is connected to the DOM
+3. reading the component URL, renderer URL, props, slots, and client directive from element attributes
+4. dynamically importing the component module and renderer
+5. reviving serialized props
+6. calling the renderer hydrator to activate the component
 
-这里有几个重要机制：
+There are a few especially important mechanisms here.
 
-### 1. `connectedCallback()` 与 `await-children`
+### `connectedCallback()` and `await-children`
 
-如果 SSR 输出还在流式进行，`astro-island` 可能先于子节点完成插入 DOM。
+During streaming SSR, the island element may be attached before all of its children arrive.
 
-因此 runtime 会：
+To handle that, the runtime can:
 
-- 监听子节点变化
-- 等待 `<!--astro:end-->` 标记出现
-- 再继续后续 hydrate
+- watch child mutations
+- wait for the `<!--astro:end-->` marker
+- continue only after the island's children are complete
 
-这保证了流式渲染场景下，岛内 HTML 已完整可用后才开始激活。
+That prevents hydration from starting before the island HTML is fully present.
 
-### 2. `start()`
+### `start()`
 
-`start()` 会读取当前 island 的 `client` 属性，并调用对应的 directive：
+`start()` reads the island's `client` attribute and calls the matching directive:
 
 - `load`
 - `idle`
@@ -192,203 +192,198 @@ Astro 在 SSR 输出过程中，会按需注入两类脚本：
 - `media`
 - `only`
 
-如果某个 directive 脚本尚未注册，runtime 会等待 `astro:${directive}` 事件后重试。
+If the directive script has not registered yet, the runtime waits for `astro:${directive}` and retries.
 
-### 3. `hydrate()`
+### `hydrate()`
 
-真正的 hydrate 发生在 `hydrate()` 中：
+The actual activation happens in `hydrate()`:
 
-- 先恢复 slots
-- 再反序列化 props
-- 最后调用 renderer 的 hydrator 执行框架级别的激活
+- restore slot content
+- revive serialized props
+- call the framework hydrator
 
-hydrate 完成后会：
+After hydration finishes, the runtime:
 
-- 移除 `ssr` 属性
-- 派发 `astro:hydrate` 事件
+- removes the `ssr` attribute
+- dispatches `astro:hydrate`
 
-### 4. 父子 island 的 hydrate 顺序
+### Parent-before-child hydration
 
-runtime 会检查：
+The runtime checks:
 
 - `this.parentElement?.closest('astro-island[ssr]')`
 
-如果存在尚未完成 hydrate 的父 island，就等待父 island 先触发 `astro:hydrate`。
+If an ancestor island is still waiting to hydrate, the child waits until the parent emits `astro:hydrate`.
 
-这意味着 Astro 明确保证：
+So Astro explicitly hydrates:
 
-- **父 island 先 hydrate**
-- **子 island 后 hydrate**
+- **parent islands first**
+- **child islands second**
 
-从而避免父组件重新挂载时破坏子 island。
-
----
-
-## 七、`client:*` 指令本身只是“hydrate 时机”
-
-关键文件：
-
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/client/load.ts`
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/client/idle.ts`
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/client/visible.ts`
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/client/media.ts`
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/client/only.ts`
-
-这些文件都非常薄，它们本质上只负责：
-
-1. 等待一个时机
-2. 调用 `load()` 加载 hydrator
-3. 执行 hydrate
-
-每个指令的语义如下：
-
-- `client:load`：页面加载后立即 hydrate
-- `client:idle`：浏览器空闲时 hydrate
-- `client:visible`：元素可见时 hydrate
-- `client:media`：匹配媒体查询时 hydrate
-- `client:only`：跳过 SSR，仅在客户端渲染
-
-因此，从架构角度看，Astro 的 client directives 不是另一套复杂框架，而只是控制 island **何时激活** 的触发器。
+That avoids nested islands being recreated or broken by a parent hydration pass.
 
 ---
 
-## 八、服务端 islands：`server:defer`
+## 7. `client:*` directives only decide *when* hydration happens
 
-除了客户端 islands，Astro 还支持服务端 islands。
+Key files:
 
-关键文件：
+- `packages/astro/src/runtime/client/load.ts`
+- `packages/astro/src/runtime/client/idle.ts`
+- `packages/astro/src/runtime/client/visible.ts`
+- `packages/astro/src/runtime/client/media.ts`
+- `packages/astro/src/runtime/client/only.ts`
 
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/server/render/server-islands.ts`
-- `/home/runner/work/astro/astro/packages/astro/src/core/server-islands/endpoint.ts`
-- `/home/runner/work/astro/astro/packages/astro/src/core/server-islands/vite-plugin-server-islands.ts`
+These directive implementations are intentionally thin. They mostly do three things:
 
-### 1. 识别服务端 island
+1. wait for a trigger condition
+2. call `load()` to fetch the hydrator
+3. execute hydration
 
-在：
+Their meaning is:
 
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/server/render/component.ts`
+- `client:load`: hydrate as soon as the page is ready
+- `client:idle`: hydrate during browser idle time
+- `client:visible`: hydrate when the island becomes visible
+- `client:media`: hydrate when a media query matches
+- `client:only`: skip SSR and render only on the client
 
-里，如果组件 props 中带有 `server:*` 指令，就会切换到 `ServerIslandComponent` 路径。
-
-### 2. 先输出 fallback，再异步替换
-
-`ServerIslandComponent` 在 SSR 输出时不会直接把完整内容塞进主页面，而是：
-
-1. 输出 fallback
-2. 插入一个运行时脚本
-3. 请求 `/_server-islands/[name]`
-4. 拿到真实 HTML 后替换占位内容
-
-### 3. 请求载荷会被加密
-
-在：
-
-- `/home/runner/work/astro/astro/packages/astro/src/runtime/server/render/server-islands.ts`
-
-中，组件导出名、props 和 slots 都会先加密，再通过 GET 或 POST 发给服务端 endpoint。
-
-这样做的目的是：
-
-- 避免明文暴露内部组件信息
-- 限制被篡改的风险
-
-### 4. endpoint 返回 HTML
-
-在：
-
-- `/home/runner/work/astro/astro/packages/astro/src/core/server-islands/endpoint.ts`
-
-中，Astro 会：
-
-1. 解析请求
-2. 解密组件导出名、props 和 slots
-3. 找到对应模块
-4. 再次执行服务端渲染
-5. 返回 HTML 片段
-
-这和客户端 islands 的思路不同：客户端 islands 的目标是“局部 hydrate”；服务端 islands 的目标是“局部延迟服务端渲染并回填 HTML”。
+Architecturally, Astro's client directives are not a second rendering system. They are just scheduling hooks for island activation.
 
 ---
 
-## 九、构建期如何收集 server islands
+## 8. Server islands: `server:defer`
 
-关键文件：
+Astro also supports server islands in addition to client islands.
 
-- `/home/runner/work/astro/astro/packages/astro/src/core/server-islands/vite-plugin-server-islands.ts`
+Key files:
 
-这个 Vite 插件负责：
+- `packages/astro/src/runtime/server/render/server-islands.ts`
+- `packages/astro/src/core/server-islands/endpoint.ts`
+- `packages/astro/src/core/server-islands/vite-plugin-server-islands.ts`
 
-- 从 `meta.astro.serverComponents` 中发现服务端 islands
-- 为它们生成名字与模块路径映射
-- 构建 `virtual:astro:server-island-manifest`
+### Identifying a server island
 
-最终运行时可以通过这个 manifest：
+In:
 
-- 从 island 名称找到实际组件模块
-- 为 `/_server-islands/[name]` endpoint 提供可渲染的 import map
+- `packages/astro/src/runtime/server/render/component.ts`
 
----
+components with `server:*` metadata are routed into `ServerIslandComponent`.
 
-## 十、最关键的代码位置
+### Rendering fallback first, then replacing it
 
-如果只看最核心的实现，建议优先阅读以下文件。
+`ServerIslandComponent` does not immediately inline the final HTML into the page. Instead it:
 
-### 客户端 islands
+1. renders fallback content
+2. emits a runtime script
+3. requests `/_server-islands/[name]`
+4. replaces the placeholder with the fetched HTML
 
-1. `/home/runner/work/astro/astro/packages/astro/src/vite-plugin-astro/index.ts`
-   - 编译后产出 `hydratedComponents` / `clientOnlyComponents` / `serverComponents`
+### Encrypting the payload
 
-2. `/home/runner/work/astro/astro/packages/astro/src/runtime/server/hydration.ts`
-   - 解析 `client:*` 指令
-   - 生成 `<astro-island>` 的 hydration 元数据
+In:
 
-3. `/home/runner/work/astro/astro/packages/astro/src/runtime/server/render/component.ts`
-   - 决定组件是否要变成 island
-   - 输出 `<astro-island>`
+- `packages/astro/src/runtime/server/render/server-islands.ts`
 
-4. `/home/runner/work/astro/astro/packages/astro/src/runtime/server/scripts.ts`
-   - 注入 directive 脚本和 island runtime
+the component export name, props, and slots are encrypted before being sent through GET or POST.
 
-5. `/home/runner/work/astro/astro/packages/astro/src/runtime/server/astro-island.ts`
-   - 浏览器端 island runtime 核心
+That protects internal component metadata and reduces the risk of request tampering.
 
-6. `/home/runner/work/astro/astro/packages/astro/src/runtime/client/load.ts`
-7. `/home/runner/work/astro/astro/packages/astro/src/runtime/client/idle.ts`
-8. `/home/runner/work/astro/astro/packages/astro/src/runtime/client/visible.ts`
-9. `/home/runner/work/astro/astro/packages/astro/src/runtime/client/media.ts`
-10. `/home/runner/work/astro/astro/packages/astro/src/runtime/client/only.ts`
-   - 定义不同 `client:*` 指令的触发时机
+### Returning HTML from the endpoint
 
-### 服务端 islands
+In:
 
-11. `/home/runner/work/astro/astro/packages/astro/src/runtime/server/render/server-islands.ts`
-    - 生成 `server:defer` 的占位和替换脚本
+- `packages/astro/src/core/server-islands/endpoint.ts`
 
-12. `/home/runner/work/astro/astro/packages/astro/src/core/server-islands/endpoint.ts`
-    - 返回服务端 island 的 HTML
+Astro:
 
-13. `/home/runner/work/astro/astro/packages/astro/src/core/server-islands/vite-plugin-server-islands.ts`
-    - 构建期收集并生成 manifest
+1. parses the request
+2. decrypts the export name, props, and slots
+3. loads the right component module
+4. renders it on the server
+5. returns an HTML fragment
+
+This differs from client islands. Client islands exist to hydrate interactive UI in place; server islands exist to defer a server render and fill the result back into the page later.
 
 ---
 
-## 十一、总结
+## 9. Build time: collecting the server island manifest
 
-Astro 的 island 架构本质上是：
+Key file:
 
-1. **编译期识别带 `client:*` / `server:*` 的组件**
-2. **SSR 先输出静态 HTML**
-3. **把需要交互的组件包装成 `<astro-island>`**
-4. **把组件地址、renderer、props 和 hydrate 策略序列化进标签属性**
-5. **浏览器端通过 `astro-island` 自定义元素按需局部 hydrate**
-6. **`server:defer` 则通过独立 endpoint 延迟返回 HTML 并替换占位**
+- `packages/astro/src/core/server-islands/vite-plugin-server-islands.ts`
 
-因此，Astro island 架构并不是一个单独的“渲染器”，而是一套横跨：
+This Vite plugin:
 
-- 编译器元数据
-- SSR 输出
-- 页面脚本注入
-- 浏览器 runtime
-- 服务端延迟渲染
+- discovers server islands from `meta.astro.serverComponents`
+- generates names and module-path mappings for them
+- builds `virtual:astro:server-island-manifest`
 
-的完整机制。
+At runtime, that manifest lets Astro:
+
+- map a server island name back to a real component module
+- supply the import map used by the `/_server-islands/[name]` endpoint
+
+---
+
+## 10. The most important files to read
+
+If you only want the core implementation, start with these files.
+
+### Client islands
+
+1. `packages/astro/src/vite-plugin-astro/index.ts`
+   - compiler output for `hydratedComponents`, `clientOnlyComponents`, and `serverComponents`
+
+2. `packages/astro/src/runtime/server/hydration.ts`
+   - parses `client:*` directives
+   - generates hydration metadata for `<astro-island>`
+
+3. `packages/astro/src/runtime/server/render/component.ts`
+   - decides whether a component becomes an island
+   - emits `<astro-island>`
+
+4. `packages/astro/src/runtime/server/scripts.ts`
+   - injects directive scripts and the island runtime
+
+5. `packages/astro/src/runtime/server/astro-island.ts`
+   - the core browser runtime for islands
+
+6. `packages/astro/src/runtime/client/load.ts`
+7. `packages/astro/src/runtime/client/idle.ts`
+8. `packages/astro/src/runtime/client/visible.ts`
+9. `packages/astro/src/runtime/client/media.ts`
+10. `packages/astro/src/runtime/client/only.ts`
+    - define when each built-in `client:*` directive triggers hydration
+
+### Server islands
+
+11. `packages/astro/src/runtime/server/render/server-islands.ts`
+    - creates the `server:defer` placeholder and replacement script
+
+12. `packages/astro/src/core/server-islands/endpoint.ts`
+    - returns the HTML for a deferred server island
+
+13. `packages/astro/src/core/server-islands/vite-plugin-server-islands.ts`
+    - collects server islands and builds the manifest
+
+---
+
+## 11. Summary
+
+Astro's island architecture is fundamentally:
+
+1. **compile-time detection of components marked with `client:*` or `server:*`**
+2. **server-rendered static HTML as the initial output**
+3. **wrapping interactive regions in `<astro-island>`**
+4. **serializing component URLs, renderer URLs, props, and hydration strategy onto that element**
+5. **hydrating those regions later through the `astro-island` custom element**
+6. **using `server:defer` to fetch deferred server-rendered HTML from a dedicated endpoint**
+
+So Astro islands are not a separate renderer. They are a cross-cutting mechanism spanning:
+
+- compiler metadata
+- SSR output
+- page script injection
+- browser runtime hydration
+- deferred server rendering
